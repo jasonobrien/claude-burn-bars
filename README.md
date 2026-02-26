@@ -8,6 +8,8 @@ Don't you hate it when your Claude usage allowance runs out mid-flow and you're 
 
 The **5h bar** shows your current context-window usage. The **7d bar** tracks your rolling 7-day API utilization, calculates your burn rate per work day, and warns you if you're on pace to hit the limit before the window resets.
 
+Credit due: Inspired by [this post](https://codelynx.dev/posts/claude-code-usage-limits-statusline)
+
 ## Scripts
 
 | Script | What it does |
@@ -18,13 +20,15 @@ The **5h bar** shows your current context-window usage. The **7d bar** tracks yo
 
 ## Install
 
+These scripts are for Mac and use the `security` command-line tool to read the needed credentials.
+If you are not using a Mac, you will need an alternative method to authorize for Anthropic API access.
+
 ```bash
 git clone https://github.com/guyw/claude-statusline-burn-bars.git
 cd claude-statusline-burn-bars
-
+chmod +x *.sh
 # Copy to a folder on your PATH
 cp claude-usage-7d.sh claude-usage-5h.sh <somewhere-on-your-PATH>/
-chmod +x <somewhere-on-your-PATH>/claude-usage-7d.sh <somewhere-on-your-PATH>/claude-usage-5h.sh
 ```
 
 ## Add to your status line
