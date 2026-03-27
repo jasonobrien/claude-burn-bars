@@ -5,7 +5,7 @@
 # burn rate per work day, and projects whether you'll exceed the limit
 # before the rolling window resets.
 #
-# Requires: jq, curl, bc, and macOS Keychain with Claude Code credentials.
+# Requires: jq, curl, bc, and either macOS Keychain or ~/.claude/.credentials.json (Linux).
 #
 # Usage:
 #   claude-usage-7d.sh [OPTIONS]
@@ -40,7 +40,7 @@ Fetches 7-day usage from the Anthropic API, calculates the average
 burn rate per work day, and projects whether you'll exceed the limit
 before the rolling window resets.
 
-Requires: jq, curl, bc, and macOS Keychain with Claude Code credentials.
+Requires: jq, curl, bc, and either macOS Keychain or ~/.claude/.credentials.json (Linux).
 
 Usage:
   claude-usage-7d.sh [OPTIONS]
@@ -95,10 +95,16 @@ CACHE_FILE="$CACHE_DIR/7d-response.json"
 
 fetch_from_api() {
   local token
-  token=$(
-    security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
-      | jq -r '.claudeAiOauth.accessToken'
-  )
+  if [[ "$(uname)" == "Darwin" ]]; then
+    token=$(
+      security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+        | jq -r '.claudeAiOauth.accessToken'
+    )
+  else
+    token=$(
+      jq -r '.claudeAiOauth.accessToken' "$HOME/.claude/.credentials.json" 2>/dev/null
+    )
+  fi
 
   if [ -z "$token" ] || [ "$token" = "null" ]; then
     echo "Error: could not retrieve Claude Code access token from Keychain" >&2
@@ -117,7 +123,13 @@ fetch_from_api() {
 
 cache_is_stale() {
   [ ! -f "$CACHE_FILE" ] && return 0
-  local age=$(( $(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0) ))
+  local mtime
+  if [[ "$(uname)" == "Darwin" ]]; then
+    mtime=$(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+  else
+    mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)
+  fi
+  local age=$(( $(date +%s) - mtime ))
   [ "$age" -gt "$CACHE_TTL" ]
 }
 
@@ -144,55 +156,109 @@ if [ -z "$utilization" ] || [ "$utilization" = "null" ]; then
   exit 1
 fi
 
-# --- Date helpers (BSD date on macOS) ---
+# --- Epoch helpers ---
 
-is_weekend() {
+parse_iso_epoch() {
+  # Parse an ISO 8601 timestamp (with optional fractional seconds and tz offset) to Unix epoch.
+  local ts="$1"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # Strip fractional seconds; convert colon in tz offset (+HH:MM → +HHMM) for BSD date.
+    local ts_clean
+    ts_clean=$(printf '%s' "$ts" \
+      | sed 's/\.[0-9]*//' \
+      | sed 's/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')
+    date -j -f "%Y-%m-%dT%H:%M:%S%z" "$ts_clean" "+%s"
+  else
+    date -d "$ts" "+%s"
+  fi
+}
+
+epoch_to_local_date() {
+  # Convert a Unix epoch to a YYYY-MM-DD string in the local timezone.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    date -j -r "$1" "+%Y-%m-%d"
+  else
+    date -d "@$1" "+%Y-%m-%d"
+  fi
+}
+
+start_of_day_epoch() {
+  # Return the epoch for midnight (local time) of the day containing epoch $1.
+  local d
+  d=$(epoch_to_local_date "$1")
+  if [[ "$(uname)" == "Darwin" ]]; then
+    date -j -f "%Y-%m-%d" "$d" "+%s"
+  else
+    date -d "$d" "+%s"
+  fi
+}
+
+is_weekend_epoch() {
+  # Return 0 (true) if the local calendar day of epoch $1 is a configured weekend day.
   [ -z "$WEEKEND_DAYS" ] && return 1
   local dow
-  dow=$(date -j -f "%Y-%m-%d" "$1" "+%u")
+  if [[ "$(uname)" == "Darwin" ]]; then
+    dow=$(date -j -r "$1" "+%u")
+  else
+    dow=$(date -d "@$1" "+%u")
+  fi
   for wd in $WEEKEND_DAYS; do
     [ "$dow" = "$wd" ] && return 0
   done
   return 1
 }
 
-# Count work days in a half-open range [start, end).
-count_work_days() {
-  local cur="$1" end="$2" count=0
-  while [ "$cur" != "$end" ]; do
-    is_weekend "$cur" || count=$((count + 1))
-    cur=$(date -j -v+1d -f "%Y-%m-%d" "$cur" "+%Y-%m-%d")
+# Count work seconds in [start_epoch, end_epoch), iterating local calendar days.
+# Partial days at each boundary are counted proportionally.
+count_work_seconds() {
+  local start="$1" end="$2"
+  [ "$start" -ge "$end" ] && echo 0 && return
+  local total=0 cur next day_start day_end
+  cur=$(start_of_day_epoch "$start")
+  while [ "$cur" -lt "$end" ]; do
+    next=$(( cur + 86400 ))
+    day_start=$(( cur > start ? cur : start ))
+    day_end=$(( next < end ? next : end ))
+    if ! is_weekend_epoch "$cur"; then
+      total=$(( total + day_end - day_start ))
+    fi
+    cur=$next
   done
-  echo "$count"
+  echo "$total"
 }
 
-# --- Compute dates ---
+# --- Compute timestamps ---
 
-# resets_at is an ISO timestamp like "2026-02-26T…"; extract the date part.
-reset_date=${resets_at%%T*}
-window_start=$(date -j -v-7d -f "%Y-%m-%d" "$reset_date" "+%Y-%m-%d")
-today=$(date "+%Y-%m-%d")
+reset_epoch=$(parse_iso_epoch "$resets_at")
+now_epoch=$(date "+%s")
+window_start_epoch=$(( reset_epoch - 7 * 24 * 3600 ))
 
-# --- Count work days ---
+# Local date strings for display only.
+window_start_display=$(epoch_to_local_date "$window_start_epoch")
+reset_display=$(epoch_to_local_date "$reset_epoch")
 
-elapsed_work_days=$(count_work_days "$window_start" "$today")
-remaining_work_days=$(count_work_days "$today" "$reset_date")
+# --- Count work time ---
+
+elapsed_work_secs=$(count_work_seconds "$window_start_epoch" "$now_epoch")
+remaining_work_secs=$(count_work_seconds "$now_epoch" "$reset_epoch")
 
 # --- Calculate rates ---
 
-if [ "$elapsed_work_days" -gt 0 ]; then
-  avg_per_day=$(echo "scale=1; $utilization / $elapsed_work_days" | bc)
+# Express elapsed/remaining as fractional work days (86400 s = 1 day) for display.
+elapsed_work_days=$(echo "scale=1; $elapsed_work_secs / 86400" | bc)
+remaining_work_days=$(echo "scale=1; $remaining_work_secs / 86400" | bc)
+
+# Compute avg and projection directly from seconds to avoid divide-by-zero when
+# elapsed_work_days rounds down to 0 (e.g. only a few hours into the window).
+if [ "$elapsed_work_secs" -gt 0 ]; then
+  avg_per_day=$(echo "scale=2; $utilization * 86400 / $elapsed_work_secs" | bc)
+  projected_remaining=$(echo "scale=1; $remaining_work_secs * $avg_per_day / 86400" | bc)
 else
   avg_per_day="N/A"
+  projected_remaining="N/A"
 fi
 
 remaining_budget=$(echo "scale=1; 100 - $utilization" | bc)
-
-if [ "$avg_per_day" != "N/A" ]; then
-  projected_remaining=$(echo "scale=1; $remaining_work_days * $avg_per_day" | bc)
-else
-  projected_remaining="N/A"
-fi
 
 # --- Determine warning status ---
 
@@ -225,13 +291,15 @@ if [ "$BAR_MODE" = true ]; then
 
   printf "7d %s %s\n" "$bar" "$icon"
 else
-  printf "7-day utilization:   %s%%\n" "$utilization"
-  printf "Window:              %s → %s\n" "$window_start" "$reset_date"
-  printf "Work days elapsed:   %s\n" "$elapsed_work_days"
-  printf "Avg usage/work day:  %s%%\n" "$avg_per_day"
-  printf "Remaining work days: %s\n" "$remaining_work_days"
-  printf "Remaining budget:    %s%%\n" "$remaining_budget"
-  printf "Projected remaining: %s%%\n" "$projected_remaining"
+  remaining_h=$(( remaining_work_secs / 3600 ))
+  remaining_m=$(( (remaining_work_secs % 3600) / 60 ))
+  printf "7-day utilization:    %s%%\n" "$utilization"
+  printf "Window:               %s → %s\n" "$window_start_display" "$reset_display"
+  printf "Work time elapsed:    %s days\n" "$elapsed_work_days"
+  printf "Avg usage/work day:   %s%%\n" "$avg_per_day"
+  printf "Work time remaining:  %s days (%dh %02dm)\n" "$remaining_work_days" "$remaining_h" "$remaining_m"
+  printf "Remaining budget:     %s%%\n" "$remaining_budget"
+  printf "Projected remaining:  %s%%\n" "$projected_remaining"
 
   if [ "$is_over" = true ]; then
     projected_total=$(echo "scale=1; $utilization + $projected_remaining" | bc)
